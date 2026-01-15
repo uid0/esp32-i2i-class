@@ -39,6 +39,40 @@ const int LED_PIN = LED_BUILTIN; // GPIO21 - User LED on XIAO-ESP32-S3
 const int NEOPIXEL_PIN = A0;     // GPIO2 (A0 on XIAO) - Good for Neopixels
 const int NUM_LEDS = 60;
 
+// Attachment configuration
+enum AttachmentType {
+  ATTACHMENT_NEOPIXEL,
+  ATTACHMENT_BUILTIN,
+  ATTACHMENT_RGB,
+  ATTACHMENT_TRAFFIC
+};
+
+// Select the attachment type used on the board here:
+const AttachmentType ATTACHMENT = ATTACHMENT_TRAFFIC; // change as needed
+
+// Pins for RGB / Traffic light attachments (examples: D7,D8,D9)
+const int RGB_R_PIN = D7;
+const int RGB_G_PIN = D8;
+const int RGB_B_PIN = D9;
+
+const int TRAFFIC_RED_PIN = D7;
+const int TRAFFIC_YELLOW_PIN = D8;
+const int TRAFFIC_GREEN_PIN = D9;
+
+// Sensor configuration
+enum SensorType {
+  SENSOR_DHT_TEMP,      // Temperature and Humidity (DHT22 or similar)
+  SENSOR_MQ7_GAS        // MQ7 Gas Sensor (CO detector)
+};
+
+// Select the sensor type used on the board here:
+const SensorType SENSOR = SENSOR_MQ7_GAS; // change as needed
+
+// Pin definitions for sensors
+const int DHT_PIN = D0;           // GPIO1 (D0 on XIAO) - DHT temperature/humidity sensor
+const int MQ7_ANALOG_PIN = A1;    // GPIO3 (A1 on XIAO) - MQ7 analog output
+const int MQ7_DIGITAL_PIN = D2;   // GPIO26 (D2 on XIAO) - MQ7 digital output (threshold)
+
 // Timing
 const unsigned long TEMP_READ_INTERVAL = 30000; // 30 seconds
 const unsigned long JWT_REFRESH_INTERVAL = 1800000; // 30 minutes (refresh JWT before 1hr expiry)
@@ -51,8 +85,15 @@ const char* OTA_PUBLIC_KEY = "-----BEGIN PUBLIC KEY-----\n"
                             "-----END PUBLIC KEY-----\n";
 
 // Objects
-OneWire oneWire(TEMP_SENSOR_PIN);
-DallasTemperature sensors(&oneWire);
+// Temperature sensor objects (initialized only if selected)
+#if defined(__AVR__) || defined(ESP32)
+  #include <DHT.h>
+  #define DHT_TYPE DHT22
+#endif
+
+OneWire oneWire(DHT_PIN);  // Note: using DHT_PIN instead of TEMP_SENSOR_PIN
+DallasTemperature sensors(&oneWire);  // For DHT_TEMP mode (if using OneWire)
+
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
@@ -143,7 +184,42 @@ void neopixelTemperatureFlash();
 void neopixelBreathe(CRGB color, uint32_t speed = 3000);
 void neopixelFlash(CRGB color, uint32_t duration = 100);
 void resetBreathingAnimation();
-void updateNeopixels();
+
+// Attachment-agnostic wrappers
+void initializeAttachments();
+void attachmentSetColor(CRGB color, uint8_t brightness = 50);
+void attachmentSetProgress(float progress, CRGB color);
+void attachmentSpinning(CRGB color, uint32_t speed = 100);
+void attachmentPulse(CRGB color, uint32_t speed = 1000);
+void attachmentBlink(CRGB color, uint32_t interval = 500);
+void attachmentBreathe(CRGB color, uint32_t speed = 3000);
+void attachmentFlash(CRGB color, uint32_t duration = 100);
+void attachmentTemperatureFlash();
+void updateAttachments();
+
+// Gas level thresholds (for MQ7)
+enum GasLevel {
+  GAS_LOW,        // < 5 ppm - Green (safe)
+  GAS_MEDIUM,     // 5-15 ppm - Yellow (caution)
+  GAS_HIGH,       // 15-35 ppm - Orange (warning)
+  GAS_CRITICAL    // > 35 ppm - Red (danger)
+};
+
+// Sensor-agnostic wrapper functions
+void initializeSensor();
+struct SensorReadings {
+  float temperature;
+  float humidity;
+  float gasLevel;
+  bool success;
+  bool digitalThreshold;  // For MQ7 digital output
+  GasLevel gasCategoryLevel;  // Categorized gas level
+};
+SensorReadings readSensor();
+void publishSensorData();
+
+// Global variable to track current gas level
+GasLevel currentGasLevel = GAS_LOW;
 
 // OTA Function declarations
 void handleFirmwareUpdateMessage(JsonDocument& updateMsg);
@@ -185,11 +261,10 @@ void setup() {
   }
   
   // Initialize Neopixels
-  initializeNeopixels();
+  initializeAttachments();
   
-  // Initialize temperature sensor
-  sensors.begin();
-  Serial.println("Temperature sensor initialized");
+  // Initialize sensor (DHT or MQ7)
+  initializeSensor();
   
   // Generate device hostname from MAC
   String macAddress = WiFi.macAddress();
@@ -225,12 +300,213 @@ void setup() {
   Serial.println("Setup complete! MQTT connection will be attempted in the main loop.");
 }
 
+// ===== Attachment wrapper implementations =====
+
+void initializeAttachments() {
+  switch (ATTACHMENT) {
+    case ATTACHMENT_NEOPIXEL:
+      Serial.println("=== Initializing Neopixel Attachment ===");
+      initializeNeopixels();
+      break;
+    case ATTACHMENT_BUILTIN:
+      Serial.println("=== Initializing Built-in LED Attachment ===");
+      pinMode(LED_PIN, OUTPUT);
+      digitalWrite(LED_PIN, LOW);
+      Serial.print("Built-in LED on pin: ");
+      Serial.println(LED_PIN);
+      break;
+    case ATTACHMENT_RGB:
+      Serial.println("=== Initializing RGB LED Attachment ===");
+      pinMode(RGB_R_PIN, OUTPUT);
+      pinMode(RGB_G_PIN, OUTPUT);
+      pinMode(RGB_B_PIN, OUTPUT);
+      digitalWrite(RGB_R_PIN, LOW);
+      digitalWrite(RGB_G_PIN, LOW);
+      digitalWrite(RGB_B_PIN, LOW);
+      Serial.print("RGB Red pin: ");
+      Serial.print(RGB_R_PIN);
+      Serial.print(" | Green pin: ");
+      Serial.print(RGB_G_PIN);
+      Serial.print(" | Blue pin: ");
+      Serial.println(RGB_B_PIN);
+      break;
+    case ATTACHMENT_TRAFFIC:
+      Serial.println("=== Initializing Traffic Light Attachment ===");
+      pinMode(TRAFFIC_RED_PIN, OUTPUT);
+      pinMode(TRAFFIC_YELLOW_PIN, OUTPUT);
+      pinMode(TRAFFIC_GREEN_PIN, OUTPUT);
+      digitalWrite(TRAFFIC_RED_PIN, LOW);
+      digitalWrite(TRAFFIC_YELLOW_PIN, LOW);
+      digitalWrite(TRAFFIC_GREEN_PIN, LOW);
+      Serial.print("Traffic Red pin: ");
+      Serial.print(TRAFFIC_RED_PIN);
+      Serial.print(" | Yellow pin: ");
+      Serial.print(TRAFFIC_YELLOW_PIN);
+      Serial.print(" | Green pin: ");
+      Serial.println(TRAFFIC_GREEN_PIN);
+      break;
+  }
+}
+
+static unsigned long _attach_lastBlink = 0;
+static bool _attach_blinkState = false;
+static unsigned long _attach_lastSpin = 0;
+static uint8_t _attach_spinPos = 0;
+
+void attachmentSetColor(CRGB color, uint8_t brightness) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    setNeopixelColor(color, brightness);
+    return;
+  }
+
+  // For non-Neopixel attachments, map color to digital outputs
+  bool isOn = !(color == CRGB::Black);
+
+  if (ATTACHMENT == ATTACHMENT_BUILTIN) {
+    digitalWrite(LED_PIN, isOn ? HIGH : LOW);
+    return;
+  }
+
+  if (ATTACHMENT == ATTACHMENT_RGB) {
+    digitalWrite(RGB_R_PIN, color.r > 0 ? HIGH : LOW);
+    digitalWrite(RGB_G_PIN, color.g > 0 ? HIGH : LOW);
+    digitalWrite(RGB_B_PIN, color.b > 0 ? HIGH : LOW);
+    return;
+  }
+
+  if (ATTACHMENT == ATTACHMENT_TRAFFIC) {
+    // Map primary colors to traffic LEDs
+    if (color == CRGB::Red) {
+      digitalWrite(TRAFFIC_RED_PIN, HIGH);
+      digitalWrite(TRAFFIC_YELLOW_PIN, LOW);
+      digitalWrite(TRAFFIC_GREEN_PIN, LOW);
+    } else if (color == CRGB::Yellow) {
+      digitalWrite(TRAFFIC_RED_PIN, LOW);
+      digitalWrite(TRAFFIC_YELLOW_PIN, HIGH);
+      digitalWrite(TRAFFIC_GREEN_PIN, LOW);
+    } else if (color == CRGB::Green) {
+      digitalWrite(TRAFFIC_RED_PIN, LOW);
+      digitalWrite(TRAFFIC_YELLOW_PIN, LOW);
+      digitalWrite(TRAFFIC_GREEN_PIN, HIGH);
+    } else if (color == CRGB::White) {
+      digitalWrite(TRAFFIC_RED_PIN, HIGH);
+      digitalWrite(TRAFFIC_YELLOW_PIN, HIGH);
+      digitalWrite(TRAFFIC_GREEN_PIN, HIGH);
+    } else {
+      // default: turn all off
+      digitalWrite(TRAFFIC_RED_PIN, LOW);
+      digitalWrite(TRAFFIC_YELLOW_PIN, LOW);
+      digitalWrite(TRAFFIC_GREEN_PIN, LOW);
+    }
+    return;
+  }
+}
+
+void attachmentSetProgress(float progress, CRGB color) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    setNeopixelProgress(progress, color);
+    return;
+  }
+
+  // For simple attachments, show color while progress > 0
+  if (progress > 0.001) {
+    attachmentSetColor(color);
+  } else {
+    attachmentSetColor(CRGB::Black);
+  }
+}
+
+void attachmentBlink(CRGB color, uint32_t interval) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelBlink(color, interval);
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - _attach_lastBlink > interval) {
+    _attach_blinkState = !_attach_blinkState;
+    _attach_lastBlink = now;
+    if (_attach_blinkState) {
+      attachmentSetColor(color);
+    } else {
+      attachmentSetColor(CRGB::Black);
+    }
+  }
+}
+
+void attachmentPulse(CRGB color, uint32_t speed) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelPulse(color, speed);
+    return;
+  }
+
+  // Fallback to blink with faster interval
+  attachmentBlink(color, max(20U, speed / 10));
+}
+
+void attachmentSpinning(CRGB color, uint32_t speed) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelSpinning(color, speed);
+    return;
+  }
+
+  // For RGB/traffic, rotate through R->G->B
+  unsigned long now = millis();
+  if (now - _attach_lastSpin > speed) {
+    _attach_spinPos = (_attach_spinPos + 1) % 3;
+    _attach_lastSpin = now;
+    if (ATTACHMENT == ATTACHMENT_RGB) {
+      digitalWrite(RGB_R_PIN, _attach_spinPos == 0 ? HIGH : LOW);
+      digitalWrite(RGB_G_PIN, _attach_spinPos == 1 ? HIGH : LOW);
+      digitalWrite(RGB_B_PIN, _attach_spinPos == 2 ? HIGH : LOW);
+    } else if (ATTACHMENT == ATTACHMENT_TRAFFIC) {
+      digitalWrite(TRAFFIC_RED_PIN, _attach_spinPos == 0 ? HIGH : LOW);
+      digitalWrite(TRAFFIC_YELLOW_PIN, _attach_spinPos == 1 ? HIGH : LOW);
+      digitalWrite(TRAFFIC_GREEN_PIN, _attach_spinPos == 2 ? HIGH : LOW);
+    } else {
+      // builtin LED: just toggle
+      digitalWrite(LED_PIN, !_attach_spinPos ? HIGH : LOW);
+    }
+  }
+}
+
+void attachmentBreathe(CRGB color, uint32_t speed) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelBreathe(color, speed);
+    return;
+  }
+
+  // For non-Neopixel attachments: implement slow blink as breathing substitute
+  // Traffic lights, RGB, and built-in LED will pulse the color on/off
+  attachmentBlink(color, speed / 2);  // Half the speed for slower breathing effect
+}
+
+void attachmentFlash(CRGB color, uint32_t duration) {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelFlash(color, duration);
+    return;
+  }
+
+  attachmentSetColor(color);
+  delay(duration);
+  attachmentSetColor(CRGB::Black);
+}
+
+void attachmentTemperatureFlash() {
+  if (ATTACHMENT == ATTACHMENT_NEOPIXEL) {
+    neopixelTemperatureFlash();
+    return;
+  }
+  // Simple brief white flash
+  attachmentFlash(CRGB::White, 50);
+}
+
 void loop() {
   // Update LED status
   updateLEDStatus();
   
   // Update Neopixels
-  updateNeopixels();
+  updateAttachments();
   
   // Check and maintain connections
   checkConnections();
@@ -508,24 +784,35 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void readAndPublishTemperature() {
-  Serial.println("=== Reading Temperature ===");
+  Serial.println("=== Reading Sensor Data ===");
   
-  // LED flash is handled in the publish function
+  // Read sensor data (DHT or MQ7)
+  SensorReadings reading = readSensor();
   
-  sensors.requestTemperatures();
-  float temperature = sensors.getTempCByIndex(0);
-  
-  if (temperature != DEVICE_DISCONNECTED_C) {
-    Serial.print("Temperature: ");
-    Serial.print(temperature);
-    Serial.println("°C");
-    
-    // Create JSON payload
+  if (reading.success) {
+    // Create JSON payload with available readings
     JsonDocument doc;
     doc["device_id"] = DEVICE_ID;
-    doc["temperature"] = temperature;
     doc["timestamp"] = getCurrentUnixTime();
-    doc["unit"] = "celsius";
+    
+    if (SENSOR == SENSOR_DHT_TEMP) {
+      Serial.print("Temperature: ");
+      Serial.print(reading.temperature);
+      Serial.println("°C");
+      Serial.print("Humidity: ");
+      Serial.print(reading.humidity);
+      Serial.println("%");
+      doc["temperature"] = reading.temperature;
+      doc["humidity"] = reading.humidity;
+      doc["unit"] = "celsius";
+    } else if (SENSOR == SENSOR_MQ7_GAS) {
+      Serial.print("Gas Level (ppm): ");
+      Serial.println(reading.gasLevel);
+      doc["sensor_type"] = "MQ7";
+      doc["gas_type"] = "CO";
+      doc["ppm"] = reading.gasLevel;
+      doc["unit"] = "ppm";
+    }
     
     String jsonString;
     serializeJson(doc, jsonString);
@@ -534,13 +821,19 @@ void readAndPublishTemperature() {
     setLEDStatus(LED_MQTT_SENDING);
     lastMQTTSend = millis();
     
-    // Publish to MQTT
-    String tempTopic = deviceHostname + "/sensors/temperature";
-    mqttClient.publish(tempTopic.c_str(), jsonString.c_str());
+    // Publish to MQTT with sensor-specific topic
+    String sensorTopic;
+    if (SENSOR == SENSOR_DHT_TEMP) {
+      sensorTopic = deviceHostname + "/sensors/temperature";
+    } else if (SENSOR == SENSOR_MQ7_GAS) {
+      sensorTopic = deviceHostname + "/sensors/airquality";
+    }
+    
+    mqttClient.publish(sensorTopic.c_str(), jsonString.c_str());
     Serial.print("Published to: ");
-    Serial.println(tempTopic);
+    Serial.println(sensorTopic);
   } else {
-    Serial.println("Temperature sensor error!");
+    Serial.println("Sensor read error!");
   }
 }
 
@@ -614,19 +907,19 @@ String generateJWT() {
 void setLEDStatus(LEDStatus status) {
   if (currentLEDStatus != status) {
     currentLEDStatus = status;
-    Serial.print("LED Status changed to: ");
+    Serial.print("=== LED Status Changed to: ");
     switch (status) {
-      case LED_OFF: Serial.println("OFF"); break;
-      case LED_WIFI_CONNECTING: Serial.println("WiFi Connecting (blue blink)"); break;
-      case LED_MQTT_CONNECTING: Serial.println("MQTT Connecting (yellow blink)"); break;
-      case LED_MQTT_CONNECTED: Serial.println("MQTT Connected (green breathing)"); break;
-      case LED_MQTT_SENDING: Serial.println("MQTT Sending (white flash)"); break;
-      case LED_MQTT_RECEIVING: Serial.println("MQTT Receiving (red flash)"); break;
-      case LED_OTA_DOWNLOADING: Serial.println("OTA Downloading (orange progress)"); break;
-      case LED_OTA_VALIDATING: Serial.println("OTA Validating (cyan spin)"); break;
-      case LED_OTA_INSTALLING: Serial.println("OTA Installing (red pulse)"); break;
-      case LED_TEMPERATURE_READ: Serial.println("Temperature Reading (white flash)"); break;
-      case LED_ERROR: Serial.println("Error (red blink)"); break;
+      case LED_OFF: Serial.println("OFF ==="); break;
+      case LED_WIFI_CONNECTING: Serial.println("WiFi Connecting (blue blink) ==="); break;
+      case LED_MQTT_CONNECTING: Serial.println("MQTT Connecting (yellow blink) ==="); break;
+      case LED_MQTT_CONNECTED: Serial.println("MQTT Connected (green breathing) ==="); break;
+      case LED_MQTT_SENDING: Serial.println("MQTT Sending (white flash) ==="); break;
+      case LED_MQTT_RECEIVING: Serial.println("MQTT Receiving (red flash) ==="); break;
+      case LED_OTA_DOWNLOADING: Serial.println("OTA Downloading (orange progress) ==="); break;
+      case LED_OTA_VALIDATING: Serial.println("OTA Validating (cyan spin) ==="); break;
+      case LED_OTA_INSTALLING: Serial.println("OTA Installing (red pulse) ==="); break;
+      case LED_TEMPERATURE_READ: Serial.println("Temperature Reading (white flash) ==="); break;
+      case LED_ERROR: Serial.println("Error (red blink) ==="); break;
     }
   }
 }
@@ -916,8 +1209,8 @@ bool downloadFirmware(const String& url, size_t& downloadedSize) {
           Serial.print(progress);
           Serial.println("%");
           
-          // Update Neopixel progress bar
-          setNeopixelProgress((float)progress / 100.0, CRGB::Orange);
+          // Update attachment progress bar (Neopixel or fallback)
+          attachmentSetProgress((float)progress / 100.0, CRGB::Orange);
         }
       }
     }
@@ -1043,6 +1336,149 @@ void checkForFirmwareUpdates() {
   // - Trigger update if newer version available
   
   publishOTAStatus(OTA_CHECKING, "Periodic update check");
+}
+
+// ===== SENSOR FUNCTIONS =====
+
+// MQ7 Calibration parameters
+const float MQ7_RL = 10.0;        // Load resistance in kOhms
+const float MQ7_RO = 10.0;        // R0 calibration (can be adjusted)
+const float MQ7_VCC = 3.3;        // Supply voltage
+const float MQ7_ADC_MAX = 4095.0; // ESP32 ADC resolution
+
+// MQ7 Gas Response Curve Parameters for CO (ppm)
+// Sensitivity: Rs/R0 = a * (ppm)^b
+const float CO_CURVE_A = 116.6;   // Curve coefficient
+const float CO_CURVE_B = -2.769;  // Curve exponent
+
+// NOTE: To calibrate MQ7 R0 value:
+// 1. Expose sensor to clean air only
+// 2. Measure the ADC value and voltage
+// 3. Calculate Rs using: Rs = RL * (VCC / Vout - 1)
+// 4. In clean air, Rs/R0 should be approximately 0.9-1.0
+// 5. Adjust MQ7_RO until Rs/R0 ≈ 0.9 when in clean air
+// 6. Then use the sensor for measurement
+
+void initializeSensor() {
+  switch (SENSOR) {
+    case SENSOR_DHT_TEMP:
+      sensors.begin();
+      Serial.println("DHT Temperature/Humidity sensor initialized on pin D0");
+      break;
+      
+    case SENSOR_MQ7_GAS:
+      pinMode(MQ7_ANALOG_PIN, INPUT);
+      pinMode(MQ7_DIGITAL_PIN, INPUT);
+      Serial.println("=== MQ7 Gas Sensor Initialization ===");
+      Serial.print("Analog input pin: ");
+      Serial.println(MQ7_ANALOG_PIN);
+      Serial.print("Digital input pin (threshold): ");
+      Serial.println(MQ7_DIGITAL_PIN);
+      Serial.println("MQ7 Sensor Parameters:");
+      Serial.print("  Load Resistance (RL): ");
+      Serial.print(MQ7_RL);
+      Serial.println(" kΩ");
+      Serial.print("  Calibration R0: ");
+      Serial.print(MQ7_RO);
+      Serial.println(" kΩ");
+      Serial.println("Note: MQ7 requires warm-up time for accurate readings");
+      Serial.println("Sensor will stabilize after 30-60 seconds of operation");
+      break;
+  }
+}
+
+SensorReadings readSensor() {
+  SensorReadings reading = {0.0, 0.0, 0.0, false};
+  
+  switch (SENSOR) {
+    case SENSOR_DHT_TEMP: {
+      sensors.requestTemperatures();
+      float temp = sensors.getTempCByIndex(0);
+      
+      if (temp != DEVICE_DISCONNECTED_C) {
+        reading.temperature = temp;
+        reading.humidity = 0.0;  // Placeholder - would need DHT library for actual humidity
+        reading.success = true;
+      } else {
+        Serial.println("Temperature sensor error!");
+        reading.success = false;
+      }
+      break;
+    }
+    
+    case SENSOR_MQ7_GAS: {
+      // Read MQ7 analog value
+      int rawValue = analogRead(MQ7_ANALOG_PIN);
+      bool digitalThreshold = digitalRead(MQ7_DIGITAL_PIN);
+      
+      // Convert ADC value to voltage
+      float voltage = (rawValue / MQ7_ADC_MAX) * MQ7_VCC;
+      
+      // Calculate Rs (sensor resistance) from voltage divider
+      // Vout = VCC * RL / (RS + RL)
+      // RS = RL * (VCC / Vout - 1)
+      float rs = MQ7_RL * (MQ7_VCC / voltage - 1.0);
+      
+      // Calculate Rs/R0 ratio
+      float ratio = rs / MQ7_RO;
+      
+      // Convert ratio to ppm using MQ7 response curve
+      // ppm = (Rs/R0 / a) ^ (1/b)
+      float ppm = 0.0;
+      if (ratio > 0) {
+        ppm = CO_CURVE_A * pow(ratio, CO_CURVE_B);
+        if (ppm < 0) ppm = 0;  // Ensure non-negative
+      }
+      
+      reading.gasLevel = ppm;
+      reading.digitalThreshold = digitalThreshold;
+      reading.success = true;
+      
+      // Categorize gas level based on ppm thresholds
+      if (ppm < 5.0) {
+        reading.gasCategoryLevel = GAS_LOW;
+      } else if (ppm < 15.0) {
+        reading.gasCategoryLevel = GAS_MEDIUM;
+      } else if (ppm < 35.0) {
+        reading.gasCategoryLevel = GAS_HIGH;
+      } else {
+        reading.gasCategoryLevel = GAS_CRITICAL;
+      }
+      
+      // Update global gas level for LED status
+      currentGasLevel = reading.gasCategoryLevel;
+      
+      // Debug output
+      Serial.print("MQ7 - ADC Raw: ");
+      Serial.print(rawValue);
+      Serial.print(" | Voltage: ");
+      Serial.print(voltage, 2);
+      Serial.print("V | Rs: ");
+      Serial.print(rs, 1);
+      Serial.print("kΩ | Ratio: ");
+      Serial.print(ratio, 3);
+      Serial.print(" | CO Level: ");
+      Serial.print(ppm, 1);
+      Serial.print(" ppm (");
+      switch(reading.gasCategoryLevel) {
+        case GAS_LOW: Serial.print("LOW"); break;
+        case GAS_MEDIUM: Serial.print("MEDIUM"); break;
+        case GAS_HIGH: Serial.print("HIGH"); break;
+        case GAS_CRITICAL: Serial.print("CRITICAL"); break;
+      }
+      Serial.print(") | Digital Threshold: ");
+      Serial.println(digitalThreshold ? "HIGH" : "LOW");
+      break;
+    }
+  }
+  
+  return reading;
+}
+
+void publishSensorData() {
+  // This is a convenience wrapper for readAndPublishTemperature
+  // Called automatically in the main loop
+  readAndPublishTemperature();
 }
 
 // ===== NEOPIXEL FUNCTIONS =====
@@ -1240,7 +1676,7 @@ void neopixelFlash(CRGB color, uint32_t duration) {
   FastLED.show();
 }
 
-void updateNeopixels() {
+void updateAttachments() {
   // Handle activity flash sequence: Flash → Black pause → Resume breathing
   unsigned long now = millis();
   
@@ -1268,48 +1704,67 @@ void updateNeopixels() {
   
   switch (currentLEDStatus) {
     case LED_OFF:
-      setNeopixelColor(CRGB::Black, 0);
+      attachmentSetColor(CRGB::Black, 0);
       break;
-      
+
     case LED_WIFI_CONNECTING:
-      neopixelBlink(CRGB::Blue, 1000); // Slow blue blink
+      attachmentBlink(CRGB::Blue, 1000); // Slow blue blink
       break;
-      
+
     case LED_MQTT_CONNECTING:
-      neopixelBlink(CRGB::Yellow, 250); // Fast yellow blink
+      attachmentBlink(CRGB::Yellow, 250); // Fast yellow blink
       break;
-      
+
     case LED_MQTT_CONNECTED:
-      neopixelBreathe(CRGB::Green, 5000); // Slower, more zen-like breathing (5 seconds)
+      // For MQ7 sensor, show air quality status with breathing LED
+      if (SENSOR == SENSOR_MQ7_GAS) {
+        switch (currentGasLevel) {
+          case GAS_LOW:
+            attachmentBreathe(CRGB::Green, 5000);  // Green = safe
+            break;
+          case GAS_MEDIUM:
+            attachmentBreathe(CRGB::Yellow, 5000); // Yellow = caution
+            break;
+          case GAS_HIGH:
+            attachmentBreathe(CRGB(255, 165, 0), 5000); // Orange = warning
+            break;
+          case GAS_CRITICAL:
+            attachmentBlink(CRGB::Red, 250);  // Red blink = danger
+            break;
+        }
+      } else {
+        // For temperature sensor, just green breathing
+        attachmentBreathe(CRGB::Green, 5000);
+      }
       break;
-      
+
     case LED_MQTT_SENDING:
-      neopixelFlash(CRGB::White, 150); // Brief white flash
+      attachmentFlash(CRGB::White, 150); // Brief white flash
       break;
-      
+
     case LED_MQTT_RECEIVING:
-      neopixelFlash(CRGB::Red, 150); // Brief red flash
+      attachmentFlash(CRGB::Red, 150); // Brief red flash
       break;
-      
+
     case LED_OTA_DOWNLOADING:
       // This will be updated with actual progress in OTA functions
-      neopixelSpinning(CRGB::Orange, 100); // Orange spinning for now
+      attachmentSpinning(CRGB::Orange, 100); // Spinning (if supported)
       break;
-      
+
     case LED_OTA_VALIDATING:
-      neopixelSpinning(CRGB::Cyan, 50); // Fast cyan spinning
+      attachmentSpinning(CRGB::Cyan, 50); // Fast spin
       break;
-      
+
     case LED_OTA_INSTALLING:
-      neopixelPulse(CRGB::Red, 200); // Fast red pulse
+      attachmentPulse(CRGB::Red, 200); // Fast red pulse
       break;
-      
+
     case LED_TEMPERATURE_READ:
-      neopixelTemperatureFlash(); // Brief white flash
+      attachmentTemperatureFlash(); // Brief white flash
       break;
-      
+
     case LED_ERROR:
-      neopixelBlink(CRGB::Red, 200); // Fast red blink
+      attachmentBlink(CRGB::Red, 200); // Fast red blink
       break;
   }
 }

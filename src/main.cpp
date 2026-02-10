@@ -13,6 +13,16 @@
 #include <mbedtls/sha256.h>
 #include <FastLED.h>
 
+#ifdef ESP32
+#include "esp_camera.h"
+// JPEG capture tuning (used when temporarily reinitializing camera to JPEG)
+// Choose a larger frame size and better JPEG quality for ambiguous-frame uploads.
+// FRAMESIZE_* constants: QQVGA(160x120), QCIF, QVGA(320x240), VGA(640x480), SVGA, XGA, SXGA, UXGA
+const framesize_t CAMERA_JPEG_FRAME_SIZE = FRAMESIZE_VGA;
+const int CAMERA_JPEG_QUALITY = 8; // 0 = highest quality, 63 = lowest quality
+const int CAMERA_JPEG_XCLK_HZ = 20000000;
+#endif
+
 // Firmware Version
 #define FIRMWARE_VERSION "1.6.0"
 #define BUILD_TIMESTAMP __DATE__ " " __TIME__
@@ -48,7 +58,7 @@ enum AttachmentType {
 };
 
 // Select the attachment type used on the board here:
-const AttachmentType ATTACHMENT = ATTACHMENT_TRAFFIC; // change as needed
+const AttachmentType ATTACHMENT = ATTACHMENT_BUILTIN; // change as needed
 
 // Pins for RGB / Traffic light attachments (examples: D7,D8,D9)
 const int RGB_R_PIN = D7;
@@ -61,17 +71,89 @@ const int TRAFFIC_GREEN_PIN = D9;
 
 // Sensor configuration
 enum SensorType {
-  SENSOR_DHT_TEMP,      // Temperature and Humidity (DHT22 or similar)
-  SENSOR_MQ7_GAS        // MQ7 Gas Sensor (CO detector)
+  SENSOR_DHT_TEMP,        // Temperature and Humidity (DHT22 or similar)
+  SENSOR_MQ7_GAS,         // MQ7 Gas Sensor (CO detector)
+  SENSOR_SENSE,           // Overhead doorway sense (two-beam direction sensor)
+  SENSOR_SENSE_CAMERA     // Camera-based overhead doorway sensor (OV5640/OV2640)
 };
 
 // Select the sensor type used on the board here:
-const SensorType SENSOR = SENSOR_MQ7_GAS; // change as needed
+const SensorType SENSOR = SENSOR_SENSE_CAMERA; // change as needed
 
 // Pin definitions for sensors
 const int DHT_PIN = D0;           // GPIO1 (D0 on XIAO) - DHT temperature/humidity sensor
 const int MQ7_ANALOG_PIN = A1;    // GPIO3 (A1 on XIAO) - MQ7 analog output
 const int MQ7_DIGITAL_PIN = D2;   // GPIO26 (D2 on XIAO) - MQ7 digital output (threshold)
+
+// Pins for SENSOR_SENSE (two sensors to determine direction)
+// Place these above the doorway, offset so that an approaching person trips
+// the sensors sequentially. Change pins as needed for your wiring.
+const int SENSE_A_PIN = D3; // Sensor A (e.g., closer to entry side)
+const int SENSE_B_PIN = D4; // Sensor B (e.g., closer to exit side)
+const unsigned long SENSE_TIMEOUT_MS = 1000; // Time window (ms) to consider sequential triggers
+const bool SENSE_ACTIVE_LOW = true; // If sensors use pull-ups and go LOW when triggered
+
+// Camera settings (OV5640/OV2640 via ESP32-CAM connector)
+// NOTE: These are typical ESP32-CAM pin mappings — adjust to your wiring.
+const bool CAMERA_ENABLED_BY_DEFAULT = true;
+// XIAO ESP32S3 Sense card slot pin mapping (DVP signals)
+const int CAM_PIN_PWDN = -1;
+const int CAM_PIN_RESET = -1;
+const int CAM_PIN_XCLK = 10;   // XMCLK
+const int CAM_PIN_PCLK = 13;   // DVP_PCLK
+const int CAM_PIN_VSYNC = 38;  // DVP_VSYNC
+const int CAM_PIN_HREF = 47;   // DVP_HREF
+
+// SCCB (I2C) for camera configuration
+const int CAM_PIN_SIOD = 40;   // CAM_SDA
+const int CAM_PIN_SIOC = 39;   // CAM_SCL
+
+// Data lines mapped to DVP_Y2..DVP_Y9 on the XIAO ESP32S3 Sense slot
+// D0..D7 -> DVP_Y2..DVP_Y9 respectively
+const int CAM_PIN_D0 = 15; // DVP_Y2 (GPIO15)
+const int CAM_PIN_D1 = 17; // DVP_Y3 (GPIO17)
+const int CAM_PIN_D2 = 18; // DVP_Y4 (GPIO18)
+const int CAM_PIN_D3 = 16; // DVP_Y5 (GPIO16)
+const int CAM_PIN_D4 = 14; // DVP_Y6 (GPIO14)
+const int CAM_PIN_D5 = 12; // DVP_Y7 (GPIO12)
+const int CAM_PIN_D6 = 11; // DVP_Y8 (GPIO11)
+const int CAM_PIN_D7 = 48; // DVP_Y9 (GPIO48)
+
+// Frame-diff parameters
+const int CAM_FRAME_WIDTH = 160;
+const int CAM_FRAME_HEIGHT = 120;
+const int CAM_DIFF_THRESHOLD = 30; // per-pixel threshold
+const int CAM_MOTION_MIN_PIXELS = 200; // min changed pixels to consider motion
+const int CAM_AMBIGUOUS_PIXELS = 800; // above this, consider ambiguous and send frame
+
+// Where ambiguous/full frames are published (MQTT topic base). The actual
+// topic used is `deviceHostname + "/" + CAMERA_FRAME_TOPIC_BASE`.
+const char CAMERA_FRAME_TOPIC_BASE[] = "camera/frames/motion/ambiguous";
+// Optional HTTP endpoint to POST ambiguous frames to (empty = disabled)
+const char CAMERA_FRAME_HTTP_ENDPOINT[] = ""; // e.g. "https://example.com/frames"
+
+// Frame upload method selection
+enum FrameUploadMethod {
+  UPLOAD_NONE,
+  UPLOAD_HTTP_JWT, // Multi-part upload to your endpoint using JWT (default)
+  UPLOAD_NTFY      // Direct POST to ntfy.sh style endpoint (binary body)
+};
+
+// Choose which method to use for HTTP uploads
+const FrameUploadMethod CAMERA_FRAME_UPLOAD_METHOD = UPLOAD_NONE;
+
+// If using NTFY, you can set a token here (optional). The endpoint should be
+// something like "https://ntfy.sh/your-topic". If token is set, it will be
+// sent as `Authorization: Bearer <token>`.
+const char CAMERA_NTFY_TOKEN[] = "";
+
+// JPEG capture tuning constants are defined in the ESP32 camera section
+
+// Camera runtime state
+bool cameraAvailable = false;
+uint8_t* prevFrame = NULL;
+uint8_t* currFrame = NULL;
+int prevMotionX = -1;
 
 // Timing
 const unsigned long TEMP_READ_INTERVAL = 30000; // 30 seconds
@@ -217,9 +299,28 @@ struct SensorReadings {
 };
 SensorReadings readSensor();
 void publishSensorData();
+// SENSOR_SENSE function declarations
+void updateSenseSensor();
+void publishTrafficEvent(const char* event, int inCount, int outCount);
+// Camera-based sense declarations
+bool initializeCameraModule();
+bool captureGrayscaleFrame(uint8_t* buf, int w, int h); // fills buf with w*h bytes (0-255)
+void processCameraFrame();
 
 // Global variable to track current gas level
 GasLevel currentGasLevel = GAS_LOW;
+
+// ===== SENSOR_SENSE (doorway traffic) globals =====
+enum SenseState {
+  SENSE_IDLE,
+  SENSE_A_TRIGGERED,
+  SENSE_B_TRIGGERED
+};
+
+volatile int senseInCount = 0;
+volatile int senseOutCount = 0;
+SenseState senseState = SENSE_IDLE;
+unsigned long senseLastTriggerTime = 0;
 
 // OTA Function declarations
 void handleFirmwareUpdateMessage(JsonDocument& updateMsg);
@@ -232,6 +333,12 @@ String calculateFirmwareSHA256();
 void checkForFirmwareUpdates();
 
 void setup() {
+  // Early visual boot indicator (useful if Serial is not visible)
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+  delay(150);
+  digitalWrite(LED_PIN, LOW);
+
   Serial.begin(115200);
   delay(1000);
   
@@ -507,6 +614,8 @@ void loop() {
   
   // Update Neopixels
   updateAttachments();
+  // Update doorway sense sensor (if enabled)
+  updateSenseSensor();
   
   // Check and maintain connections
   checkConnections();
@@ -684,6 +793,10 @@ void connectToMQTT() {
     mqttClient.subscribe(lightTopic.c_str());
     Serial.print("Subscribed to: ");
     Serial.println(lightTopic);
+    // Subscribe to camera test topic (one-shot capture request)
+    String cameraTestTopic = deviceHostname + "/camera/test";
+    mqttClient.subscribe(cameraTestTopic.c_str());
+    Serial.print("Subscribed to camera test topic: "); Serial.println(cameraTestTopic);
     
     // Subscribe to firmware update topic
     String firmwareUpdateTopic = deviceHostname + "/firmware/update";
@@ -768,6 +881,111 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     mqttClient.publish(statusTopic.c_str(), status.c_str());
   }
   
+  // Handle camera test request (one-shot capture)
+  String cameraTestTopic = deviceHostname + "/camera/test";
+  String cameraResponseTopic = deviceHostname + "/camera/test/response";
+  if (String(topic) == cameraTestTopic) {
+    Serial.println("Received camera test request via MQTT");
+    // Capture and publish a JPEG frame if possible
+    #ifdef ESP32
+    if (!cameraAvailable) {
+      Serial.println("Camera not available - cannot run test");
+    } else if (!mqttClient.connected()) {
+      Serial.println("MQTT not connected - cannot publish test frame");
+    } else {
+      Serial.println("Attempting one-shot JPEG capture for MQTT test...");
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb && fb->format == PIXFORMAT_JPEG) {
+        Serial.print("Publishing JPEG frame (size="); Serial.print(fb->len); Serial.println(")");
+        mqttClient.publish(cameraResponseTopic.c_str(), (const uint8_t*)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+      } else {
+        if (fb) { esp_camera_fb_return(fb); fb = NULL; }
+        Serial.println("Reinitializing camera to JPEG mode for one-shot test...");
+        esp_err_t deinit_r = esp_camera_deinit();
+        Serial.print("esp_camera_deinit() returned: "); Serial.println(deinit_r);
+        delay(100);
+        camera_config_t jpegConfig;
+        memset(&jpegConfig, 0, sizeof(jpegConfig));
+        jpegConfig.ledc_channel = LEDC_CHANNEL_0;
+        jpegConfig.ledc_timer = LEDC_TIMER_0;
+        jpegConfig.pin_d0 = CAM_PIN_D0;
+        jpegConfig.pin_d1 = CAM_PIN_D1;
+        jpegConfig.pin_d2 = CAM_PIN_D2;
+        jpegConfig.pin_d3 = CAM_PIN_D3;
+        jpegConfig.pin_d4 = CAM_PIN_D4;
+        jpegConfig.pin_d5 = CAM_PIN_D5;
+        jpegConfig.pin_d6 = CAM_PIN_D6;
+        jpegConfig.pin_d7 = CAM_PIN_D7;
+        jpegConfig.pin_xclk = CAM_PIN_XCLK;
+        jpegConfig.pin_pclk = CAM_PIN_PCLK;
+        jpegConfig.pin_vsync = CAM_PIN_VSYNC;
+        jpegConfig.pin_href = CAM_PIN_HREF;
+        jpegConfig.pin_sccb_sda = CAM_PIN_SIOD;
+        jpegConfig.pin_sccb_scl = CAM_PIN_SIOC;
+        jpegConfig.pin_pwdn = CAM_PIN_PWDN;
+        jpegConfig.pin_reset = CAM_PIN_RESET;
+        jpegConfig.xclk_freq_hz = CAMERA_JPEG_XCLK_HZ;
+        jpegConfig.pixel_format = PIXFORMAT_JPEG;
+        jpegConfig.frame_size = CAMERA_JPEG_FRAME_SIZE;
+        jpegConfig.jpeg_quality = CAMERA_JPEG_QUALITY;
+        jpegConfig.fb_count = 1;
+
+        esp_err_t r = esp_camera_init(&jpegConfig);
+        if (r == ESP_OK) {
+          camera_fb_t* jfb = esp_camera_fb_get();
+          if (jfb) {
+            Serial.print("Captured JPEG frame for test, size="); Serial.println(jfb->len);
+            mqttClient.publish(cameraResponseTopic.c_str(), (const uint8_t*)jfb->buf, jfb->len);
+            esp_camera_fb_return(jfb);
+          } else {
+            Serial.println("Failed to capture JPEG frame after reinit for test");
+          }
+          // Restore RGB565 mode used for frame-diff
+          Serial.println("Restoring camera to RGB565 mode after test...");
+          esp_camera_deinit();
+          delay(100);
+          camera_config_t rgbConfig;
+          memset(&rgbConfig, 0, sizeof(rgbConfig));
+          rgbConfig.ledc_channel = LEDC_CHANNEL_0;
+          rgbConfig.ledc_timer = LEDC_TIMER_0;
+          rgbConfig.pin_d0 = CAM_PIN_D0;
+          rgbConfig.pin_d1 = CAM_PIN_D1;
+          rgbConfig.pin_d2 = CAM_PIN_D2;
+          rgbConfig.pin_d3 = CAM_PIN_D3;
+          rgbConfig.pin_d4 = CAM_PIN_D4;
+          rgbConfig.pin_d5 = CAM_PIN_D5;
+          rgbConfig.pin_d6 = CAM_PIN_D6;
+          rgbConfig.pin_d7 = CAM_PIN_D7;
+          rgbConfig.pin_xclk = CAM_PIN_XCLK;
+          rgbConfig.pin_pclk = CAM_PIN_PCLK;
+          rgbConfig.pin_vsync = CAM_PIN_VSYNC;
+          rgbConfig.pin_href = CAM_PIN_HREF;
+          rgbConfig.pin_sccb_sda = CAM_PIN_SIOD;
+          rgbConfig.pin_sccb_scl = CAM_PIN_SIOC;
+          rgbConfig.pin_pwdn = CAM_PIN_PWDN;
+          rgbConfig.pin_reset = CAM_PIN_RESET;
+          rgbConfig.xclk_freq_hz = 20000000;
+          rgbConfig.pixel_format = PIXFORMAT_RGB565;
+          rgbConfig.frame_size = FRAMESIZE_QQVGA;
+          rgbConfig.jpeg_quality = 12;
+          rgbConfig.fb_count = 1;
+          esp_err_t r2 = esp_camera_init(&rgbConfig);
+          if (r2 != ESP_OK) {
+            Serial.print("Failed to restore RGB565 camera mode after test: "); Serial.println(r2);
+            cameraAvailable = false;
+          }
+        } else {
+          Serial.print("Failed to init camera in JPEG mode for test: "); Serial.println(r);
+        }
+      }
+    }
+    #else
+    Serial.println("Camera test requested but platform is not ESP32");
+    #endif
+    return; // handled camera test
+  }
+
   // Handle firmware update messages
   if (String(topic) == firmwareUpdateTopic) {
     Serial.println("Received firmware update message");
@@ -1384,6 +1602,56 @@ void initializeSensor() {
       Serial.println("Note: MQ7 requires warm-up time for accurate readings");
       Serial.println("Sensor will stabilize after 30-60 seconds of operation");
       break;
+
+    case SENSOR_SENSE: {
+      // Configure two digital inputs for the overhead doorway sense
+      if (SENSE_ACTIVE_LOW) {
+        pinMode(SENSE_A_PIN, INPUT_PULLUP);
+        pinMode(SENSE_B_PIN, INPUT_PULLUP);
+      } else {
+        pinMode(SENSE_A_PIN, INPUT);
+        pinMode(SENSE_B_PIN, INPUT);
+      }
+      senseState = SENSE_IDLE;
+      senseInCount = 0;
+      senseOutCount = 0;
+      Serial.println("=== SENSOR_SENSE (doorway) initialized ===");
+      Serial.print("Sense A pin: "); Serial.println(SENSE_A_PIN);
+      Serial.print("Sense B pin: "); Serial.println(SENSE_B_PIN);
+      Serial.print("Sense active low: "); Serial.println(SENSE_ACTIVE_LOW ? "Yes" : "No");
+      break;
+    }
+    
+    case SENSOR_SENSE_CAMERA: {
+      // Try to initialize camera module (pins may need adjustment)
+      Serial.println("=== SENSOR_SENSE_CAMERA initialization ===");
+      cameraAvailable = initializeCameraModule();
+      if (cameraAvailable) {
+        // Allocate frame buffers for grayscale frames
+        prevFrame = (uint8_t*)malloc(CAM_FRAME_WIDTH * CAM_FRAME_HEIGHT);
+        currFrame = (uint8_t*)malloc(CAM_FRAME_WIDTH * CAM_FRAME_HEIGHT);
+        Serial.print("Attempted allocation of camera buffers. prev=");
+        Serial.print((uintptr_t)prevFrame, HEX);
+        Serial.print(" curr=");
+        Serial.println((uintptr_t)currFrame, HEX);
+        if (!prevFrame || !currFrame) {
+          Serial.println("Failed to allocate camera frame buffers - cleaning up");
+          if (prevFrame) { free(prevFrame); prevFrame = NULL; }
+          if (currFrame) { free(currFrame); currFrame = NULL; }
+          // Deinit camera to avoid driver using memory when we can't allocate buffers
+          // esp_camera_deinit() may not be available in all SDK versions — skip if undefined
+          // (no-op)
+          cameraAvailable = false;
+        } else {
+          memset(prevFrame, 0, CAM_FRAME_WIDTH * CAM_FRAME_HEIGHT);
+          memset(currFrame, 0, CAM_FRAME_WIDTH * CAM_FRAME_HEIGHT);
+          Serial.println("Camera frame buffers allocated and cleared");
+        }
+      } else {
+        Serial.println("Camera initialization failed — cameraAvailable=false");
+      }
+      break;
+    }
   }
 }
 
@@ -1480,6 +1748,542 @@ void publishSensorData() {
   // Called automatically in the main loop
   readAndPublishTemperature();
 }
+
+// Update and publish events for the SENSOR_SENSE doorway tracker
+void updateSenseSensor() {
+  unsigned long now = millis();
+
+  if (SENSOR == SENSOR_SENSE) {
+    bool aActive = (digitalRead(SENSE_A_PIN) == (SENSE_ACTIVE_LOW ? LOW : HIGH));
+    bool bActive = (digitalRead(SENSE_B_PIN) == (SENSE_ACTIVE_LOW ? LOW : HIGH));
+
+    switch (senseState) {
+      case SENSE_IDLE:
+        if (aActive && !bActive) {
+          senseState = SENSE_A_TRIGGERED;
+          senseLastTriggerTime = now;
+        } else if (bActive && !aActive) {
+          senseState = SENSE_B_TRIGGERED;
+          senseLastTriggerTime = now;
+        }
+        break;
+
+      case SENSE_A_TRIGGERED:
+        // Wait for B to trigger within timeout => entry (A -> B)
+        if (bActive) {
+          senseInCount++;
+          publishTrafficEvent("enter", senseInCount, senseOutCount);
+          senseState = SENSE_IDLE;
+        } else if (now - senseLastTriggerTime > SENSE_TIMEOUT_MS) {
+          // Timeout - reset
+          senseState = SENSE_IDLE;
+        }
+        break;
+
+      case SENSE_B_TRIGGERED:
+        // Wait for A to trigger within timeout => exit (B -> A)
+        if (aActive) {
+          senseOutCount++;
+          publishTrafficEvent("exit", senseInCount, senseOutCount);
+          senseState = SENSE_IDLE;
+        } else if (now - senseLastTriggerTime > SENSE_TIMEOUT_MS) {
+          // Timeout - reset
+          senseState = SENSE_IDLE;
+        }
+        break;
+    }
+  } else if (SENSOR == SENSOR_SENSE_CAMERA) {
+    // Camera-based processing
+    if (cameraAvailable) {
+      processCameraFrame();
+    }
+  }
+}
+
+void publishTrafficEvent(const char* event, int inCount, int outCount) {
+  Serial.print("Traffic event: "); Serial.println(event);
+  Serial.print("Counts - In: "); Serial.print(inCount); Serial.print(" Out: "); Serial.println(outCount);
+
+  JsonDocument doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["timestamp"] = getCurrentUnixTime();
+  doc["event"] = event;
+  doc["in_count"] = inCount;
+  doc["out_count"] = outCount;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  String sensorTopic = deviceHostname + "/sensors/traffic";
+  if (mqttClient.connected()) {
+    setLEDStatus(LED_MQTT_SENDING);
+    lastMQTTSend = millis();
+    mqttClient.publish(sensorTopic.c_str(), jsonString.c_str());
+    Serial.print("Published traffic event to: "); Serial.println(sensorTopic);
+  } else {
+    Serial.println("MQTT not connected - skipping publish");
+  }
+}
+
+// -------- Camera helper implementations --------
+#ifdef ESP32
+#include "esp_camera.h"
+
+bool initializeCameraModule() {
+  Serial.print("Camera init: free heap before init: "); Serial.println(ESP.getFreeHeap());
+
+  // Require some free heap for camera driver and frame buffers
+  const size_t MIN_HEAP_FOR_CAMERA = 150000; // ~150KB
+  if (ESP.getFreeHeap() < MIN_HEAP_FOR_CAMERA) {
+    Serial.println("Insufficient heap for camera init, skipping camera");
+    return false;
+  }
+
+  camera_config_t config;
+  memset(&config, 0, sizeof(config));
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = CAM_PIN_D0;
+  config.pin_d1 = CAM_PIN_D1;
+  config.pin_d2 = CAM_PIN_D2;
+  config.pin_d3 = CAM_PIN_D3;
+  config.pin_d4 = CAM_PIN_D4;
+  config.pin_d5 = CAM_PIN_D5;
+  config.pin_d6 = CAM_PIN_D6;
+  config.pin_d7 = CAM_PIN_D7;
+  config.pin_xclk = CAM_PIN_XCLK;
+  config.pin_pclk = CAM_PIN_PCLK;
+  config.pin_vsync = CAM_PIN_VSYNC;
+  config.pin_href = CAM_PIN_HREF;
+  config.pin_sccb_sda = CAM_PIN_SIOD;
+  config.pin_sccb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn = CAM_PIN_PWDN;
+  config.pin_reset = CAM_PIN_RESET;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QQVGA; // 160x120
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  // If a previous camera driver is loaded, deinit first to avoid conflicts
+  // esp_camera_deinit() may not be available in this SDK; skip explicit deinit
+
+  Serial.println("Attempting esp_camera_init()...");
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.print("Camera init failed with error 0x"); Serial.println(err, HEX);
+    Serial.print("Free heap after failed init: "); Serial.println(ESP.getFreeHeap());
+    return false;
+  }
+  Serial.print("Camera initialized successfully; free heap after init: ");
+  Serial.println(ESP.getFreeHeap());
+
+  // After init, perform gentle sensor tuning if available
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    // Set frame size for RGB565 working mode used for frame-diff
+    s->set_framesize(s, FRAMESIZE_QQVGA);
+    // Optionally increase contrast/brightness/gain for better diff results
+    // s->set_contrast(s, 1);
+    // s->set_brightness(s, 1);
+    Serial.println("Camera sensor tuning applied: framesize=QQVGA");
+  }
+
+  // Try a quick test capture to validate the camera is responsive.
+  // Some boards/drivers return success from esp_camera_init but fail to allocate
+  // or capture frames until a short delay or retry.
+  delay(200);
+  camera_fb_t* test_fb = NULL;
+  for (int i = 0; i < 3; i++) {
+    test_fb = esp_camera_fb_get();
+    if (test_fb) break;
+    Serial.print("Test capture attempt "); Serial.print(i+1); Serial.println(" failed, retrying...");
+    delay(200);
+  }
+
+  if (!test_fb) {
+    Serial.println("Camera test capture failed after init; deinitializing camera");
+    Serial.print("Free heap: "); Serial.println(ESP.getFreeHeap());
+    // esp_camera_deinit may not exist; attempt to free any internal resources by calling init with fb_count=0
+    return false;
+  }
+
+  Serial.print("Test capture OK: format="); Serial.print(test_fb->format);
+  Serial.print(" size="); Serial.println(test_fb->len);
+  esp_camera_fb_return(test_fb);
+  return true;
+}
+
+// Capture a grayscale frame resized to w*h. If JPEG capture is returned,
+// we decode to grayscale by simple sampling of luminance from JPEG buffer —
+// for simplicity we request PIXFORMAT_RGB565 when supported; fallback to
+// converting JPEG to grayscale is expensive and not implemented fully here.
+bool captureGrayscaleFrame(uint8_t* buf, int w, int h) {
+  if (!buf) return false;
+  camera_fb_t* fb = NULL;
+  // Retry a few times — sometimes the driver returns NULL briefly
+  for (int attempt = 0; attempt < 4; attempt++) {
+    fb = esp_camera_fb_get();
+    if (fb) break;
+    Serial.print("Camera capture attempt "); Serial.print(attempt+1); Serial.println(" failed, retrying...");
+    delay(100);
+  }
+  if (!fb) {
+    Serial.print("Camera capture failed; free heap: "); Serial.println(ESP.getFreeHeap());
+    // Try a recovery: deinit and reinit the camera once, then attempt capture again
+    Serial.println("Attempting camera recovery: deinit + reinit...");
+    // esp_camera_deinit() may return error on some SDKs; log but continue
+    esp_err_t derr = esp_camera_deinit();
+    Serial.print("esp_camera_deinit() returned: "); Serial.println(derr);
+    delay(100);
+    bool reinited = initializeCameraModule();
+    if (!reinited) {
+      Serial.println("Camera recovery failed (reinit unsuccessful)");
+      return false;
+    }
+
+    // Try capturing again after recovery
+    for (int attempt2 = 0; attempt2 < 4; attempt2++) {
+      fb = esp_camera_fb_get();
+      if (fb) break;
+      Serial.print("Recovery capture attempt "); Serial.print(attempt2+1); Serial.println(" failed, retrying...");
+      delay(100);
+    }
+    if (!fb) {
+      Serial.println("Camera capture failed after recovery");
+      return false;
+    }
+  }
+
+  // If framebuffer is in RGB565 format, convert to grayscale easily
+  if (fb->format == PIXFORMAT_RGB565 && fb->width >= w && fb->height >= h) {
+    // Simple nearest-neighbor downsample
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        int sx = x * fb->width / w;
+        int sy = y * fb->height / h;
+        int idx = sy * fb->width + sx;
+        uint16_t pix = ((uint16_t*)fb->buf)[idx];
+        // RGB565 -> approximate grayscale
+        uint8_t r = ((pix >> 11) & 0x1F) << 3;
+        uint8_t g = ((pix >> 5) & 0x3F) << 2;
+        uint8_t b = (pix & 0x1F) << 3;
+        uint8_t gray = (uint8_t)((0.3 * r) + (0.59 * g) + (0.11 * b));
+        buf[y * w + x] = gray;
+      }
+    }
+    esp_camera_fb_return(fb);
+    return true;
+  }
+
+  // If JPEG, we can try to extract luminance by rough sampling — heavy.
+  // For now, we fail gracefully and inform the caller.
+  Serial.println("captureGrayscaleFrame: unsupported pixel format (need RGB565) — try changing camera config");
+  esp_camera_fb_return(fb);
+  return false;
+}
+
+// Upload raw frame buffer to configured HTTP endpoint using multipart/form-data
+// Upload raw frame buffer to configured HTTP endpoint. Returns HTTP response body on success, empty string on failure.
+String uploadFrameToServer(const uint8_t* data, size_t len, const char* filename, const char* mimetype) {
+  if (CAMERA_FRAME_UPLOAD_METHOD == UPLOAD_NONE) return String("");
+  if (!wifiConnected) {
+    Serial.println("Skipping HTTP upload: WiFi not connected");
+    return String("");
+  }
+
+  HTTPClient http;
+  String responseBody = "";
+
+  if (CAMERA_FRAME_UPLOAD_METHOD == UPLOAD_HTTP_JWT) {
+    if (strlen(CAMERA_FRAME_HTTP_ENDPOINT) == 0) return String("");
+    String jwt = generateJWT();
+    http.begin(CAMERA_FRAME_HTTP_ENDPOINT);
+    http.addHeader("Authorization", "Bearer " + jwt);
+
+    String boundary = "----ESP32CAM" + String(millis());
+    String contentType = "multipart/form-data; boundary=" + boundary;
+    http.addHeader("Content-Type", contentType);
+
+    String pre = "--" + boundary + "\r\n";
+    pre += String("Content-Disposition: form-data; name=\"file\"; filename=\"") + filename + "\"\r\n";
+    pre += String("Content-Type: ") + mimetype + "\r\n\r\n";
+    String post = "\r\n--" + boundary + "--\r\n";
+
+    size_t preLen = pre.length();
+    size_t postLen = post.length();
+    size_t total = preLen + len + postLen;
+
+    uint8_t* body = (uint8_t*)malloc(total);
+    if (!body) {
+      Serial.println("Failed to allocate memory for multipart body");
+      http.end();
+      return String("");
+    }
+
+    memcpy(body, pre.c_str(), preLen);
+    memcpy(body + preLen, data, len);
+    memcpy(body + preLen + len, post.c_str(), postLen);
+
+    Serial.print("HTTP upload (JWT multipart): posting "); Serial.print(total); Serial.println(" bytes");
+    int httpCode = http.sendRequest("POST", body, total);
+    if (httpCode > 0) {
+      Serial.print("HTTP response code: "); Serial.println(httpCode);
+      responseBody = http.getString();
+      Serial.print("HTTP response body: "); Serial.println(responseBody);
+    } else {
+      Serial.print("HTTP upload failed, error: "); Serial.println(httpCode);
+    }
+    free(body);
+    http.end();
+    if (httpCode >= 200 && httpCode < 300) return responseBody;
+    return String("");
+  }
+
+  // NTFY mode: POST raw bytes directly to endpoint (no multipart)
+  if (CAMERA_FRAME_UPLOAD_METHOD == UPLOAD_NTFY) {
+    if (strlen(CAMERA_FRAME_HTTP_ENDPOINT) == 0) return String("");
+    http.begin(CAMERA_FRAME_HTTP_ENDPOINT);
+    if (strlen(CAMERA_NTFY_TOKEN) > 0) {
+      http.addHeader("Authorization", "Bearer " + String(CAMERA_NTFY_TOKEN));
+    }
+    http.addHeader("Content-Type", mimetype);
+    String disp = String("attachment; filename=\"") + String(filename) + "\"";
+    http.addHeader("Content-Disposition", disp);
+    http.addHeader("Title", String("Frame from ") + deviceHostname);
+
+    Serial.print("HTTP upload (ntfy): posting "); Serial.print(len); Serial.println(" bytes");
+    int httpCode = http.sendRequest("POST", (uint8_t*)data, len);
+    if (httpCode > 0) {
+      Serial.print("NTFY response code: "); Serial.println(httpCode);
+      responseBody = http.getString();
+      Serial.print("NTFY response body: "); Serial.println(responseBody);
+    } else {
+      Serial.print("NTFY upload failed, error: "); Serial.println(httpCode);
+    }
+    http.end();
+    if (httpCode >= 200 && httpCode < 300) return responseBody;
+    return String("");
+  }
+
+  return String("");
+}
+
+void processCameraFrame() {
+  // Capture into currFrame
+  if (!captureGrayscaleFrame(currFrame, CAM_FRAME_WIDTH, CAM_FRAME_HEIGHT)) {
+    return;
+  }
+
+  // Compute per-column motion energy by summing difference across rows
+  int width = CAM_FRAME_WIDTH;
+  int height = CAM_FRAME_HEIGHT;
+  int centerX = width / 2;
+
+  int maxColSum = 0;
+  int maxColIndex = -1;
+  int totalMotionPixels = 0;
+
+  for (int x = 0; x < width; x++) {
+    int colSum = 0;
+    for (int y = 0; y < height; y++) {
+      int idx = y * width + x;
+      int diff = abs((int)currFrame[idx] - (int)prevFrame[idx]);
+      if (diff > CAM_DIFF_THRESHOLD) {
+        colSum++;
+        totalMotionPixels++;
+      }
+    }
+    if (colSum > maxColSum) {
+      maxColSum = colSum;
+      maxColIndex = x;
+    }
+  }
+
+  // Shift current to prev for next iteration
+  memcpy(prevFrame, currFrame, width * height);
+
+  // If insufficient motion, ignore
+  if (totalMotionPixels < CAM_MOTION_MIN_PIXELS) {
+    prevMotionX = -1;
+    return;
+  }
+
+  Serial.print("Camera motion pixels: "); Serial.print(totalMotionPixels);
+  Serial.print(" | maxColIndex: "); Serial.print(maxColIndex);
+  Serial.print(" | prevMotionX: "); Serial.println(prevMotionX);
+
+  // Determine crossing based on previous motion X
+  if (prevMotionX >= 0) {
+    if (prevMotionX < centerX && maxColIndex >= centerX) {
+      // left->right crossing => enter
+      senseInCount++;
+      publishTrafficEvent("enter", senseInCount, senseOutCount);
+    } else if (prevMotionX > centerX && maxColIndex <= centerX) {
+      // right->left crossing => exit
+      senseOutCount++;
+      publishTrafficEvent("exit", senseInCount, senseOutCount);
+    } else {
+      // No clear crossing; if motion very large, treat as ambiguous
+      if (totalMotionPixels > CAM_AMBIGUOUS_PIXELS) {
+        // Capture a full JPEG frame and publish to MQTT for server-side processing
+        // Try to capture a JPEG frame (temporarily reconfigure camera to JPEG)
+        Serial.println("Ambiguous motion detected - attempting JPEG capture for upload");
+        camera_fb_t* fb = NULL;
+        // First try to get whatever frame driver currently provides
+        fb = esp_camera_fb_get();
+        if (fb && fb->format == PIXFORMAT_JPEG) {
+          // Already JPEG - use it directly
+          Serial.print("Captured ambiguous JPEG frame, size="); Serial.println(fb->len);
+          String topic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE);
+          if (mqttClient.connected()) {
+            // Publish metadata first
+            JsonDocument meta;
+            meta["device_id"] = DEVICE_ID;
+            meta["timestamp"] = getCurrentUnixTime();
+            meta["event"] = "ambiguous_frame";
+            meta["size"] = fb->len;
+            meta["format"] = "jpeg";
+            String metaStr;
+            serializeJson(meta, metaStr);
+            String metaTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/meta";
+            mqttClient.publish(metaTopic.c_str(), metaStr.c_str());
+            // Then publish binary
+            String binTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/bin";
+            mqttClient.publish(binTopic.c_str(), (const uint8_t*)fb->buf, fb->len);
+            Serial.print("Published ambiguous frame to MQTT topic: "); Serial.println(binTopic);
+          }
+          if (strlen(CAMERA_FRAME_HTTP_ENDPOINT) > 0) {
+            String resp = uploadFrameToServer((const uint8_t*)fb->buf, fb->len, "frame.jpg", "image/jpeg");
+            Serial.print("HTTP upload response: "); Serial.println(resp);
+            if (resp.length() > 0 && mqttClient.connected()) {
+              String urlTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/url";
+              mqttClient.publish(urlTopic.c_str(), resp.c_str());
+            }
+          }
+          esp_camera_fb_return(fb);
+        } else {
+          if (fb) { esp_camera_fb_return(fb); fb = NULL; }
+          // Attempt to re-init camera in JPEG mode, capture one frame, then restore RGB565
+          Serial.println("Reinitializing camera to JPEG mode for capture...");
+          // Deinitialize camera first to avoid invalid-state errors
+          Serial.println("Calling esp_camera_deinit() before JPEG reinit...");
+          esp_err_t deinit_r = esp_camera_deinit();
+          Serial.print("esp_camera_deinit() returned: "); Serial.println(deinit_r);
+          delay(100);
+
+          camera_config_t jpegConfig;
+          memset(&jpegConfig, 0, sizeof(jpegConfig));
+          jpegConfig.ledc_channel = LEDC_CHANNEL_0;
+          jpegConfig.ledc_timer = LEDC_TIMER_0;
+          jpegConfig.pin_d0 = CAM_PIN_D0;
+          jpegConfig.pin_d1 = CAM_PIN_D1;
+          jpegConfig.pin_d2 = CAM_PIN_D2;
+          jpegConfig.pin_d3 = CAM_PIN_D3;
+          jpegConfig.pin_d4 = CAM_PIN_D4;
+          jpegConfig.pin_d5 = CAM_PIN_D5;
+          jpegConfig.pin_d6 = CAM_PIN_D6;
+          jpegConfig.pin_d7 = CAM_PIN_D7;
+          jpegConfig.pin_xclk = CAM_PIN_XCLK;
+          jpegConfig.pin_pclk = CAM_PIN_PCLK;
+          jpegConfig.pin_vsync = CAM_PIN_VSYNC;
+          jpegConfig.pin_href = CAM_PIN_HREF;
+          jpegConfig.pin_sccb_sda = CAM_PIN_SIOD;
+          jpegConfig.pin_sccb_scl = CAM_PIN_SIOC;
+          jpegConfig.pin_pwdn = CAM_PIN_PWDN;
+          jpegConfig.pin_reset = CAM_PIN_RESET;
+          jpegConfig.xclk_freq_hz = CAMERA_JPEG_XCLK_HZ;
+          jpegConfig.pixel_format = PIXFORMAT_JPEG;
+          jpegConfig.frame_size = CAMERA_JPEG_FRAME_SIZE;
+          jpegConfig.jpeg_quality = CAMERA_JPEG_QUALITY;
+          jpegConfig.fb_count = 1;
+
+          // Try to init JPEG mode (try once, log error on failure)
+          esp_err_t r = esp_camera_init(&jpegConfig);
+          if (r == ESP_OK) {
+            camera_fb_t* jfb = esp_camera_fb_get();
+            if (jfb) {
+              Serial.print("Captured JPEG frame after reinit, size="); Serial.println(jfb->len);
+              if (mqttClient.connected()) {
+                // Publish metadata first
+                JsonDocument meta;
+                meta["device_id"] = DEVICE_ID;
+                meta["timestamp"] = getCurrentUnixTime();
+                meta["event"] = "ambiguous_frame";
+                meta["size"] = jfb->len;
+                meta["format"] = "jpeg";
+                String metaStr;
+                serializeJson(meta, metaStr);
+                String metaTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/meta";
+                mqttClient.publish(metaTopic.c_str(), metaStr.c_str());
+
+                // Then publish binary
+                String binTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/bin";
+                mqttClient.publish(binTopic.c_str(), (const uint8_t*)jfb->buf, jfb->len);
+              }
+              if (strlen(CAMERA_FRAME_HTTP_ENDPOINT) > 0) {
+                String resp = uploadFrameToServer((const uint8_t*)jfb->buf, jfb->len, "frame.jpg", "image/jpeg");
+                Serial.print("HTTP upload response: "); Serial.println(resp);
+                if (resp.length() > 0 && mqttClient.connected()) {
+                  String urlTopic = deviceHostname + "/" + String(CAMERA_FRAME_TOPIC_BASE) + "/url";
+                  mqttClient.publish(urlTopic.c_str(), resp.c_str());
+                }
+              }
+              esp_camera_fb_return(jfb);
+            } else {
+              Serial.println("Failed to capture JPEG frame after reinit");
+            }
+            // Attempt to restore RGB565 mode for continued frame-diff processing
+            Serial.println("Restoring camera to RGB565 mode...");
+            // Deinit before restoring
+            esp_err_t deinit2 = esp_camera_deinit();
+            Serial.print("esp_camera_deinit() returned (before restoring RGB): "); Serial.println(deinit2);
+            delay(100);
+            camera_config_t rgbConfig;
+            memset(&rgbConfig, 0, sizeof(rgbConfig));
+            rgbConfig.ledc_channel = LEDC_CHANNEL_0;
+            rgbConfig.ledc_timer = LEDC_TIMER_0;
+            rgbConfig.pin_d0 = CAM_PIN_D0;
+            rgbConfig.pin_d1 = CAM_PIN_D1;
+            rgbConfig.pin_d2 = CAM_PIN_D2;
+            rgbConfig.pin_d3 = CAM_PIN_D3;
+            rgbConfig.pin_d4 = CAM_PIN_D4;
+            rgbConfig.pin_d5 = CAM_PIN_D5;
+            rgbConfig.pin_d6 = CAM_PIN_D6;
+            rgbConfig.pin_d7 = CAM_PIN_D7;
+            rgbConfig.pin_xclk = CAM_PIN_XCLK;
+            rgbConfig.pin_pclk = CAM_PIN_PCLK;
+            rgbConfig.pin_vsync = CAM_PIN_VSYNC;
+            rgbConfig.pin_href = CAM_PIN_HREF;
+            rgbConfig.pin_sccb_sda = CAM_PIN_SIOD;
+            rgbConfig.pin_sccb_scl = CAM_PIN_SIOC;
+            rgbConfig.pin_pwdn = CAM_PIN_PWDN;
+            rgbConfig.pin_reset = CAM_PIN_RESET;
+            rgbConfig.xclk_freq_hz = 20000000;
+            rgbConfig.pixel_format = PIXFORMAT_RGB565;
+            rgbConfig.frame_size = FRAMESIZE_QQVGA;
+            rgbConfig.jpeg_quality = 12;
+            rgbConfig.fb_count = 1;
+            esp_err_t r2 = esp_camera_init(&rgbConfig);
+            if (r2 != ESP_OK) {
+              Serial.print("Failed to restore RGB565 camera mode: "); Serial.println(r2);
+              cameraAvailable = false;
+            }
+          } else {
+            Serial.print("Failed to reinit camera to JPEG mode: "); Serial.println(r);
+          }
+        }
+      }
+    }
+  }
+
+  prevMotionX = maxColIndex;
+}
+#else
+bool initializeCameraModule() { Serial.println("Camera not supported on this platform"); return false; }
+bool captureGrayscaleFrame(uint8_t* buf, int w, int h) { (void)buf; (void)w; (void)h; return false; }
+void processCameraFrame() { }
+#endif
 
 // ===== NEOPIXEL FUNCTIONS =====
 
